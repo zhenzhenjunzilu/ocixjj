@@ -30,7 +30,7 @@ set -e
 # ================= 可调参数 =================
 PORTS_PER=20                                  # 每台小鸡分配的端口数量
 POOL_START=21000                              # 端口池起始端口(建议避开20000-20099等常见默认端口)
-IMAGE="images:alpine/3.20"                    # 容器镜像(Alpine,体积小,适合高密度切鸡)
+IMAGE="images:alpine/edge"                    # 容器镜像(Alpine,体积小,适合高密度切鸡)
 STATE_FILE="/root/chicken_port_pool.state"    # 端口池分配进度记录
 LOG_FILE="/root/chicken_accounts.txt"         # 账号信息记录(名称/IP/SSH端口/端口段/密码/CPU/内存/磁盘)
 NAME_PREFIX="ck"                              # 小鸡命名前缀,如 ck1 ck2 ck3
