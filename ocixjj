@@ -1,0 +1,195 @@
+#!/bin/bash
+#
+# chicken.sh —— ARM 主机 Incus 容器批量分发管理脚本
+#
+# 适用场景: Oracle Cloud ARM (Ampere A1) + Incus 容器 + 单公网IP按端口区分多台"小鸡"
+#
+# 用法:
+#   sudo ./chicken.sh init          初始化环境:装 Incus、放开本机防火墙(只需跑一次)
+#   sudo ./chicken.sh create [N]    批量创建 N 台(默认1台),自动分配端口段、装ssh、随机密码
+#   sudo ./chicken.sh list          查看所有小鸡及其端口/密码
+#   sudo ./chicken.sh delete <名称> 删除指定小鸡(同时清理端口转发规则)
+#
+# 重要前提(脚本不会帮你做,必须手动去甲骨文控制台操作一次):
+#   VCN -> Security Lists / NSG -> Ingress Rules -> 添加规则:
+#     Source CIDR: 0.0.0.0/0
+#     IP Protocol: All Protocols
+#   不放行这条,本机端口再怎么开都连不进来,是两道独立的墙。
+#
+set -e
+
+# ================= 可调参数 =================
+PORTS_PER=20                                   # 每台小鸡分配的端口数量
+POOL_START=21000                               # 端口池起始端口(建议避开20000-20099等常见默认端口)
+IMAGE="images:debian/12"                       # 容器镜像
+STATE_FILE="/root/chicken_port_pool.state"     # 端口池分配进度记录
+LOG_FILE="/root/chicken_accounts.txt"          # 账号信息记录(名称/IP/SSH端口/端口段/密码)
+NAME_PREFIX="ck"                               # 小鸡命名前缀,如 ck1 ck2 ck3
+
+# ================= 子命令: init =================
+cmd_init() {
+    echo "===== 1. 检查/安装 Incus ====="
+    if ! command -v incus &>/dev/null; then
+        apt update
+        apt install -y incus incus-client
+    else
+        echo "Incus 已安装,跳过"
+    fi
+
+    if ! incus info &>/dev/null; then
+        echo "Incus 尚未初始化,请手动运行: incus admin init (网络选 bridge,一路默认即可)"
+        echo "初始化完成后重新执行: sudo ./chicken.sh init"
+        exit 1
+    fi
+
+    echo "===== 2. 放开本机 iptables(全部放行,防火墙统一交给OCI控制台管) ====="
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+    iptables -F
+    iptables -X
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save
+    else
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+    fi
+
+    echo ""
+    echo "===== 环境初始化完成 ====="
+    echo "!! 别忘了去 OCI 控制台放行 Security List: Source 0.0.0.0/0, Protocol All Protocols"
+    echo "!! 否则本机端口开了也没用,外部连不进来"
+}
+
+# ================= 子命令: create =================
+cmd_create() {
+    local COUNT=${1:-1}
+
+    [ -f "$STATE_FILE" ] || echo "$POOL_START" > "$STATE_FILE"
+    [ -f "$LOG_FILE" ] || echo -e "名称\tIP\tSSH端口\t端口段\t密码" > "$LOG_FILE"
+
+    get_next_index() {
+        local i=1
+        while incus info "${NAME_PREFIX}${i}" &>/dev/null; do
+            i=$((i+1))
+        done
+        echo $i
+    }
+
+    echo "开始批量创建 $COUNT 台..."
+
+    for n in $(seq 1 "$COUNT"); do
+        IDX=$(get_next_index)
+        NAME="${NAME_PREFIX}${IDX}"
+
+        NEXT_PORT=$(cat "$STATE_FILE")
+        PORT_START=$NEXT_PORT
+        PORT_END=$((PORT_START + PORTS_PER - 1))
+        echo $((PORT_END + 1)) > "$STATE_FILE"
+
+        echo "===== 创建 $NAME (端口段: ${PORT_START}-${PORT_END}) ====="
+
+        incus launch "$IMAGE" "$NAME"
+
+        IP=""
+        for i in $(seq 1 15); do
+            IP=$(incus list "$NAME" -c 4 --format csv | cut -d' ' -f1)
+            [ -n "$IP" ] && break
+            sleep 2
+        done
+
+        if [ -z "$IP" ]; then
+            echo "!! $NAME 没拿到IP,跳过,请手动检查(incus exec $NAME -- ip a)"
+            continue
+        fi
+
+        sleep 3
+
+        incus exec "$NAME" -- bash -c "apt update -qq && DEBIAN_FRONTEND=noninteractive apt install -y -qq openssh-server"
+        incus exec "$NAME" -- bash -c "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
+        incus exec "$NAME" -- bash -c "sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"
+
+        PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+        incus exec "$NAME" -- bash -c "echo 'root:${PASSWORD}' | chpasswd"
+
+        incus exec "$NAME" -- systemctl restart ssh
+
+        SSH_PORT=$PORT_START
+        incus config device add "$NAME" sshport proxy \
+            listen=tcp:0.0.0.0:${SSH_PORT} \
+            connect=tcp:127.0.0.1:22 >/dev/null
+
+        for p in $(seq $((PORT_START+1)) $PORT_END); do
+            incus config device add "$NAME" "port-$p" proxy \
+                listen=tcp:0.0.0.0:${p} \
+                connect=tcp:127.0.0.1:${p} >/dev/null
+        done
+
+        echo -e "${NAME}\t${IP}\t${SSH_PORT}\t${PORT_START}-${PORT_END}\t${PASSWORD}" >> "$LOG_FILE"
+        echo "$NAME 完成: SSH端口=${SSH_PORT}  密码=${PASSWORD}"
+    done
+
+    echo ""
+    echo "全部完成,汇总如下:"
+    column -t -s $'\t' "$LOG_FILE"
+}
+
+# ================= 子命令: list =================
+cmd_list() {
+    echo "===== Incus 容器状态 ====="
+    incus list
+    echo ""
+    if [ -f "$LOG_FILE" ]; then
+        echo "===== 账号信息 ====="
+        column -t -s $'\t' "$LOG_FILE"
+    else
+        echo "暂无账号记录($LOG_FILE 不存在)"
+    fi
+}
+
+# ================= 子命令: delete =================
+cmd_delete() {
+    local NAME="$1"
+    if [ -z "$NAME" ]; then
+        echo "用法: sudo ./chicken.sh delete <名称>"
+        exit 1
+    fi
+
+    if ! incus info "$NAME" &>/dev/null; then
+        echo "容器 $NAME 不存在"
+        exit 1
+    fi
+
+    echo "删除容器 $NAME(会自动清理其端口转发规则)..."
+    incus delete "$NAME" --force
+
+    if [ -f "$LOG_FILE" ]; then
+        grep -v "^${NAME}	" "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    fi
+
+    echo "$NAME 已删除。注意:它占用的端口段不会自动回收复用,新建的小鸡会继续往后分配,避免冲突。"
+}
+
+# ================= 主入口 =================
+case "$1" in
+    init)
+        cmd_init
+        ;;
+    create)
+        cmd_create "$2"
+        ;;
+    list)
+        cmd_list
+        ;;
+    delete)
+        cmd_delete "$2"
+        ;;
+    *)
+        echo "用法:"
+        echo "  sudo ./chicken.sh init          初始化环境(装Incus+放开防火墙,只需跑一次)"
+        echo "  sudo ./chicken.sh create [N]    批量创建N台小鸡(默认1台)"
+        echo "  sudo ./chicken.sh list          查看所有小鸡状态和账号信息"
+        echo "  sudo ./chicken.sh delete <名称>  删除指定小鸡"
+        exit 1
+        ;;
+esac
