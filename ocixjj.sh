@@ -30,7 +30,7 @@ set -e
 # ================= 可调参数 =================
 PORTS_PER=20                                  # 每台小鸡分配的端口数量
 POOL_START=21000                              # 端口池起始端口(建议避开20000-20099等常见默认端口)
-IMAGE="images:alpine/edge"                    # 容器镜像(Alpine,体积小,适合高密度切鸡)
+IMAGE="images:alpine/3.20"                    # 容器镜像(Alpine,体积小,适合高密度切鸡)
 STATE_FILE="/root/chicken_port_pool.state"    # 端口池分配进度记录
 LOG_FILE="/root/chicken_accounts.txt"         # 账号信息记录(名称/IP/SSH端口/端口段/密码/CPU/内存/磁盘)
 NAME_PREFIX="ck"                              # 小鸡命名前缀,如 ck1 ck2 ck3
@@ -226,9 +226,12 @@ cmd_create() {
             connect=tcp:127.0.0.1:22 >/dev/null
 
         for p in $(seq $((PORT_START+1)) $PORT_END); do
-            incus config device add "$NAME" "port-$p" proxy \
+            incus config device add "$NAME" "tcp-$p" proxy \
                 listen=tcp:0.0.0.0:${p} \
                 connect=tcp:127.0.0.1:${p} >/dev/null
+            incus config device add "$NAME" "udp-$p" proxy \
+                listen=udp:0.0.0.0:${p} \
+                connect=udp:127.0.0.1:${p} >/dev/null
         done
 
         echo -e "${NAME}\t${IP}\t${SSH_PORT}\t${PORT_START}-${PORT_END}\t${PASSWORD}\t${CPU}\t${MEM}\t${DISK}" >> "$LOG_FILE"
