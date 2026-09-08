@@ -5,16 +5,18 @@
 # 适用场景: Oracle Cloud ARM (Ampere A1) + Incus 容器 + 单公网IP按端口区分多台"小鸡"
 #
 # 用法:
-#   sudo ./chicken.sh init          初始化环境:装 Incus、放开本机防火墙(只需跑一次)
+#   sudo ./chicken.sh init          初始化环境:装 Incus、自动初始化、放开本机防火墙(只需跑一次)
 #   sudo ./chicken.sh create [N]    批量创建 N 台(默认1台),自动分配端口段、装ssh、随机密码
 #   sudo ./chicken.sh list          查看所有小鸡及其端口/密码
 #   sudo ./chicken.sh delete <名称> 删除指定小鸡(同时清理端口转发规则)
+#   sudo ./chicken.sh check <名称>  自检:从本机直接测试该小鸡的SSH端口是否真的能连通
 #
 # 重要前提(脚本不会帮你做,必须手动去甲骨文控制台操作一次):
 #   VCN -> Security Lists / NSG -> Ingress Rules -> 添加规则:
 #     Source CIDR: 0.0.0.0/0
 #     IP Protocol: All Protocols
 #   不放行这条,本机端口再怎么开都连不进来,是两道独立的墙。
+#   (跑 init 时脚本会打印出本机公网IP,方便你去控制台核对)
 #
 set -e
 
@@ -26,37 +28,68 @@ STATE_FILE="/root/chicken_port_pool.state"     # 端口池分配进度记录
 LOG_FILE="/root/chicken_accounts.txt"          # 账号信息记录(名称/IP/SSH端口/端口段/密码)
 NAME_PREFIX="ck"                               # 小鸡命名前缀,如 ck1 ck2 ck3
 
+# ================= 通用检查 =================
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "请用 sudo 运行本脚本"
+        exit 1
+    fi
+}
+
 # ================= 子命令: init =================
 cmd_init() {
-    echo "===== 1. 检查/安装 Incus ====="
+    echo "===== 1. 安装基础依赖 ====="
+    export DEBIAN_FRONTEND=noninteractive
+    apt update -qq
+    apt install -y -qq curl iptables iptables-persistent >/dev/null
+
+    echo "===== 2. 安装 Incus ====="
     if ! command -v incus &>/dev/null; then
-        apt update
-        apt install -y incus incus-client
+        # 先试系统自带源(较新的 Ubuntu/Debian 有 incus 包)
+        if apt-cache show incus &>/dev/null; then
+            apt install -y -qq incus incus-client
+        else
+            echo "系统自带源没有 incus 包,改用官方 Zabbly 源安装..."
+            apt install -y -qq gpg
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
+            cat <<EOF > /etc/apt/sources.list.d/zabbly-incus-stable.sources
+Enabled: yes
+Types: deb
+URIs: https://pkgs.zabbly.com/incus/stable
+Suites: $(. /etc/os-release && echo "${VERSION_CODENAME}")
+Components: main
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/zabbly.asc
+EOF
+            apt update -qq
+            apt install -y -qq incus incus-client
+        fi
     else
         echo "Incus 已安装,跳过"
     fi
 
+    echo "===== 3. 初始化 Incus(全自动默认配置) ====="
     if ! incus info &>/dev/null; then
-        echo "Incus 尚未初始化,请手动运行: incus admin init (网络选 bridge,一路默认即可)"
-        echo "初始化完成后重新执行: sudo ./chicken.sh init"
-        exit 1
+        incus admin init --auto
+        echo "已用默认配置自动初始化(本地存储 + 网桥NAT网络)。"
+        echo "如果你需要自定义存储池/网络,请先执行: incus admin init 手动配置,再重跑本脚本。"
+    else
+        echo "Incus 已初始化,跳过"
     fi
 
-    echo "===== 2. 放开本机 iptables(全部放行,防火墙统一交给OCI控制台管) ====="
+    echo "===== 4. 放开本机 iptables(全部放行,防火墙统一交给OCI控制台管) ====="
     iptables -P INPUT ACCEPT
     iptables -P FORWARD ACCEPT
     iptables -P OUTPUT ACCEPT
     iptables -F
     iptables -X
-    if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save
-    else
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4
-    fi
+    netfilter-persistent save
 
     echo ""
     echo "===== 环境初始化完成 ====="
+    PUB_IP=$(curl -s -4 --max-time 5 ifconfig.me || echo "获取失败,可手动执行: curl ifconfig.me")
+    echo "本机公网IP: ${PUB_IP}"
     echo "!! 别忘了去 OCI 控制台放行 Security List: Source 0.0.0.0/0, Protocol All Protocols"
     echo "!! 否则本机端口开了也没用,外部连不进来"
 }
@@ -76,6 +109,25 @@ cmd_create() {
         echo $i
     }
 
+    # 端口段是否与本机已在监听的端口冲突(比如80/443/其他服务),冲突则跳过整段往后找
+    find_free_port_start() {
+        local candidate=$1
+        while true; do
+            local conflict=0
+            for p in $(seq "$candidate" $((candidate + PORTS_PER - 1))); do
+                if ss -tln 2>/dev/null | awk '{print $4}' | grep -q ":${p}\$"; then
+                    conflict=1
+                    break
+                fi
+            done
+            if [ "$conflict" -eq 0 ]; then
+                echo "$candidate"
+                return
+            fi
+            candidate=$((candidate + PORTS_PER))
+        done
+    }
+
     echo "开始批量创建 $COUNT 台..."
 
     for n in $(seq 1 "$COUNT"); do
@@ -83,7 +135,7 @@ cmd_create() {
         NAME="${NAME_PREFIX}${IDX}"
 
         NEXT_PORT=$(cat "$STATE_FILE")
-        PORT_START=$NEXT_PORT
+        PORT_START=$(find_free_port_start "$NEXT_PORT")
         PORT_END=$((PORT_START + PORTS_PER - 1))
         echo $((PORT_END + 1)) > "$STATE_FILE"
 
@@ -170,7 +222,56 @@ cmd_delete() {
     echo "$NAME 已删除。注意:它占用的端口段不会自动回收复用,新建的小鸡会继续往后分配,避免冲突。"
 }
 
+# ================= 子命令: check =================
+cmd_check() {
+    local NAME="$1"
+    if [ -z "$NAME" ]; then
+        echo "用法: sudo ./chicken.sh check <名称>"
+        exit 1
+    fi
+
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "找不到账号记录文件 $LOG_FILE"
+        exit 1
+    fi
+
+    local ROW
+    ROW=$(grep "^${NAME}	" "$LOG_FILE" || true)
+    if [ -z "$ROW" ]; then
+        echo "在 $LOG_FILE 中找不到 $NAME 的记录"
+        exit 1
+    fi
+
+    local SSH_PORT PASSWORD
+    SSH_PORT=$(echo "$ROW" | cut -f3)
+    PASSWORD=$(echo "$ROW" | cut -f5)
+
+    echo "===== 自检 $NAME (本机SSH端口 ${SSH_PORT}) ====="
+
+    echo "1) 端口本机是否在监听:"
+    if ss -tln 2>/dev/null | grep -q ":${SSH_PORT} "; then
+        echo "   OK - 本机确实在监听 ${SSH_PORT}"
+    else
+        echo "   !! 本机没有监听 ${SSH_PORT},proxy device 可能没生效,检查: incus config device list ${NAME}"
+        return
+    fi
+
+    echo "2) 用密码尝试SSH登录(通过 127.0.0.1,验证转发链路本身是否通):"
+    if ! command -v sshpass &>/dev/null; then
+        apt install -y -qq sshpass >/dev/null
+    fi
+    if sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+        root@127.0.0.1 -p "$SSH_PORT" 'echo 本机内部连接成功' 2>/dev/null; then
+        echo "   OK - 本机内部能连通,说明 Incus 转发链路没问题"
+        echo "   若外部(比如你自己电脑)连不上,问题基本可以定位在: OCI控制台Security List 没放行"
+    else
+        echo "   !! 本机内部都连不上,问题在 Incus/容器内sshd本身,检查: incus exec ${NAME} -- systemctl status ssh"
+    fi
+}
+
 # ================= 主入口 =================
+require_root
+
 case "$1" in
     init)
         cmd_init
@@ -184,12 +285,16 @@ case "$1" in
     delete)
         cmd_delete "$2"
         ;;
+    check)
+        cmd_check "$2"
+        ;;
     *)
         echo "用法:"
-        echo "  sudo ./chicken.sh init          初始化环境(装Incus+放开防火墙,只需跑一次)"
+        echo "  sudo ./chicken.sh init          初始化环境(装Incus+自动init+放开防火墙,只需跑一次)"
         echo "  sudo ./chicken.sh create [N]    批量创建N台小鸡(默认1台)"
         echo "  sudo ./chicken.sh list          查看所有小鸡状态和账号信息"
         echo "  sudo ./chicken.sh delete <名称>  删除指定小鸡"
+        echo "  sudo ./chicken.sh check <名称>   自检该小鸡SSH是否真的通"
         exit 1
         ;;
 esac
