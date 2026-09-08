@@ -70,12 +70,14 @@ EOF
     fi
 
     echo "===== 3. 初始化 Incus(全自动默认配置) ====="
-    if ! incus info &>/dev/null; then
+    # 注意: `incus info` 只要 incus 服务在跑就会返回成功,哪怕从没init过也一样,
+    # 不能用它判断是否已初始化。真正靠谱的判断依据是"有没有存储池"。
+    if [ -z "$(incus storage list -f csv 2>/dev/null)" ]; then
         incus admin init --auto
         echo "已用默认配置自动初始化(本地存储 + 网桥NAT网络)。"
         echo "如果你需要自定义存储池/网络,请先执行: incus admin init 手动配置,再重跑本脚本。"
     else
-        echo "Incus 已初始化,跳过"
+        echo "Incus 已初始化(检测到存储池),跳过"
     fi
 
     echo "===== 4. 放开本机 iptables(全部放行,防火墙统一交给OCI控制台管) ====="
