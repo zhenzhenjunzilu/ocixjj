@@ -24,6 +24,16 @@
 #   不放行这条,本机端口再怎么开都连不进来,是两道独立的墙。
 #   (跑 init 时脚本会打印出本机公网IP,方便你去控制台核对)
 #
+# ---------------------------------------------------------------------------
+# 关于端口转发方式(重要变更说明):
+#   旧版每个端口用 incus proxy device 走用户态转发(forkproxy 进程),
+#   每台小鸡 20 端口(tcp+udp)= 40 个常驻进程,台数一多内存/句柄容易爆炸。
+#
+#   本版改为 proxy device 加 nat=true,由内核态 iptables/nftables 直接做
+#   DNAT 转发,不再为每个端口 fork 进程,几乎零额外常驻内存开销。
+#   代价:nat=true 模式下宿主机不会真的 listen 该端口(是DNAT不是accept),
+#   所以 check 命令改用查 iptables NAT 规则 + 实际连接测试来验证,而不是 ss -tln。
+# ---------------------------------------------------------------------------
 
 set -e
 
@@ -157,6 +167,9 @@ cmd_create() {
     }
 
     # 端口段是否与本机已在监听的端口冲突(比如80/443/其他服务),冲突则跳过整段往后找
+    # 注意: nat=true 模式下,已分配给其他小鸡的端口不会出现在 ss -tln 里(是DNAT不是listen),
+    # 所以这里只能防真实占用(比如宿主机自己跑的服务),防不了"跟其他小鸡端口段重叠"。
+    # 重叠问题由 STATE_FILE 递增分配来保证,不依赖 ss 检测。
     find_free_port_start() {
         local candidate=$1
         while true; do
@@ -220,18 +233,23 @@ cmd_create() {
         incus exec "$NAME" -- sh -c "echo 'root:${PASSWORD}' | chpasswd"
         incus exec "$NAME" -- sh -c "rc-update add sshd default && (rc-service sshd restart || rc-service sshd start)"
 
+        # ---- 端口转发: 全部走 nat=true 内核态转发,不再 fork 用户态进程 ----
+        # 注意 connect 目标必须是容器的真实IP(不能用127.0.0.1),因为是内核DNAT。
         SSH_PORT=$PORT_START
         incus config device add "$NAME" sshport proxy \
             listen=tcp:0.0.0.0:${SSH_PORT} \
-            connect=tcp:127.0.0.1:22 >/dev/null
+            connect=tcp:${IP}:22 \
+            nat=true >/dev/null
 
         for p in $(seq $((PORT_START+1)) $PORT_END); do
             incus config device add "$NAME" "tcp-$p" proxy \
                 listen=tcp:0.0.0.0:${p} \
-                connect=tcp:127.0.0.1:${p} >/dev/null
+                connect=tcp:${IP}:${p} \
+                nat=true >/dev/null
             incus config device add "$NAME" "udp-$p" proxy \
                 listen=udp:0.0.0.0:${p} \
-                connect=udp:127.0.0.1:${p} >/dev/null
+                connect=udp:${IP}:${p} \
+                nat=true >/dev/null
         done
 
         echo -e "${NAME}\t${IP}\t${SSH_PORT}\t${PORT_START}-${PORT_END}\t${PASSWORD}\t${CPU}\t${MEM}\t${DISK}" >> "$LOG_FILE"
@@ -322,7 +340,7 @@ cmd_delete() {
         exit 1
     fi
 
-    echo "删除容器 $NAME(会自动清理其端口转发规则)..."
+    echo "删除容器 $NAME(会自动清理其端口转发规则,包括nat=true下发的iptables规则)..."
     incus delete "$NAME" --force
 
     if [ -f "$LOG_FILE" ]; then
@@ -357,11 +375,11 @@ cmd_check() {
     PASSWORD=$(echo "$ROW" | cut -f5)
 
     echo "===== 自检 $NAME (本机SSH端口 ${SSH_PORT}) ====="
-    echo "1) 端口本机是否在监听:"
-    if ss -tln 2>/dev/null | grep -q ":${SSH_PORT} "; then
-        echo "   OK - 本机确实在监听 ${SSH_PORT}"
+    echo "1) NAT转发规则是否已下发(nat=true模式下宿主机不会listen该端口,查iptables NAT表):"
+    if iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q "dpt:${SSH_PORT}[^0-9]"; then
+        echo "   OK - 找到 ${SSH_PORT} 的DNAT规则"
     else
-        echo "   !! 本机没有监听 ${SSH_PORT},proxy device 可能没生效,检查: incus config device list ${NAME}"
+        echo "   !! 没找到 ${SSH_PORT} 的DNAT规则,proxy device 可能没生效,检查: incus config device list ${NAME}"
         return
     fi
 
@@ -372,7 +390,7 @@ cmd_check() {
 
     if sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
         root@127.0.0.1 -p "$SSH_PORT" 'echo 本机内部连接成功' 2>/dev/null; then
-        echo "   OK - 本机内部能连通,说明 Incus 转发链路没问题"
+        echo "   OK - 本机内部能连通,说明 Incus NAT 转发链路没问题"
         echo "   若外部(比如你自己电脑)连不上,问题基本可以定位在: OCI控制台Security List 没放行"
     else
         echo "   !! 本机内部都连不上,问题在 Incus/容器内sshd本身,检查: incus exec ${NAME} -- rc-service sshd status"
