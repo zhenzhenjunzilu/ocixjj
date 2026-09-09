@@ -239,6 +239,23 @@ cmd_create() {
 
         sleep 3
 
+        # nat=true 模式要求 proxy device 的 connect IP 必须是容器"静态声明"的地址,
+        # 单纯DHCP动态分配的IP即使数值一样也会被拒绝(报错 must be one of the instance's
+        # static IPv4 addresses)。这里找到容器的网卡设备名,把当前拿到的IP显式声明为静态。
+        NIC_DEVICE=""
+        for d in $(incus config device list "$NAME" 2>/dev/null); do
+            t=$(incus config device get "$NAME" "$d" type 2>/dev/null || echo "")
+            if [ "$t" = "nic" ]; then
+                NIC_DEVICE="$d"
+                break
+            fi
+        done
+        if [ -z "$NIC_DEVICE" ]; then
+            echo "!! $NAME 找不到网卡设备名,跳过端口转发,请手动检查: incus config device list $NAME"
+            continue
+        fi
+        incus config device override "$NAME" "$NIC_DEVICE" ipv4.address="${IP}" >/dev/null
+
         # Alpine 用 apk 装包、ash 跑脚本、OpenRC 管服务,和 Debian 版(apt/bash/systemd)不一样
         incus exec "$NAME" -- sh -c "apk update -q && apk add -q openssh"
         incus exec "$NAME" -- sh -c "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
