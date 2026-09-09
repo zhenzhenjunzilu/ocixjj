@@ -256,6 +256,21 @@ cmd_create() {
         fi
         incus config device override "$NAME" "$NIC_DEVICE" ipv4.address="${IP}" >/dev/null
 
+        # 仅仅"登记"为静态还不够,容器手里还攥着之前DHCP动态分配的旧租约,
+        # 必须重启一次让它重新走DHCP,dnsmasq才会真正把这个IP作为保留地址分配下去,
+        # 之后 config device override 声明的"静态"校验才会通过。
+        incus restart "$NAME"
+        for i in $(seq 1 15); do
+            CUR_IP=$(incus list "$NAME" -c 4 --format csv | cut -d' ' -f1)
+            [ "$CUR_IP" = "$IP" ] && break
+            sleep 2
+        done
+        if [ "$CUR_IP" != "$IP" ]; then
+            echo "!! $NAME 重启后IP有变化(重启前=$IP 重启后=$CUR_IP),改用重启后的实际IP继续"
+            IP="$CUR_IP"
+        fi
+        sleep 2
+
         # Alpine 用 apk 装包、ash 跑脚本、OpenRC 管服务,和 Debian 版(apt/bash/systemd)不一样
         incus exec "$NAME" -- sh -c "apk update -q && apk add -q openssh"
         incus exec "$NAME" -- sh -c "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
