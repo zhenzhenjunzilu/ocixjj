@@ -114,7 +114,9 @@ EOF
     fi
 
     echo "===== 3. 初始化 Incus(全自动默认配置) ====="
-    if ! incus info &>/dev/null; then
+    # 只判断服务是否能连上不够(装了包但没跑过admin init时incus info也能连上),
+    # 改为检查是否已存在存储池,这才是"真正初始化过"的标志。
+    if ! incus storage list --format csv 2>/dev/null | grep -q .; then
         incus admin init --auto
         echo "已用默认配置自动初始化(本地存储 + 网桥NAT网络)。"
         echo "如果你需要自定义存储池/网络(比如想用 zfs 以支持磁盘配额),请先执行: incus admin init 手动配置,再重跑本脚本。"
@@ -157,6 +159,19 @@ cmd_create() {
     [ -f "$LOG_FILE" ] || echo -e "名称\tIP\tSSH端口\t端口段\t密码\tCPU\t内存\t磁盘" > "$LOG_FILE"
 
     check_disk_quota_support
+
+    # nat=true 模式下 proxy device 不允许监听通配地址 0.0.0.0,必须绑定宿主机网卡的具体IP。
+    # OCI等云主机的"公网IP"通常是网关层1:1 NAT到私网IP,系统自己只看得到私网IP,
+    # 绑定这个私网IP即可,通过公网IP访问时网关会自动转进来。
+    HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+    if [ -z "$HOST_IP" ]; then
+        HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$HOST_IP" ]; then
+        echo "!! 无法自动探测宿主机网卡IP,请手动检查网络配置后重试"
+        exit 1
+    fi
+    echo "宿主机绑定IP(用于端口转发监听): ${HOST_IP}"
 
     get_next_index() {
         local i=1
@@ -237,17 +252,17 @@ cmd_create() {
         # 注意 connect 目标必须是容器的真实IP(不能用127.0.0.1),因为是内核DNAT。
         SSH_PORT=$PORT_START
         incus config device add "$NAME" sshport proxy \
-            listen=tcp:0.0.0.0:${SSH_PORT} \
+            listen=tcp:${HOST_IP}:${SSH_PORT} \
             connect=tcp:${IP}:22 \
             nat=true >/dev/null
 
         for p in $(seq $((PORT_START+1)) $PORT_END); do
             incus config device add "$NAME" "tcp-$p" proxy \
-                listen=tcp:0.0.0.0:${p} \
+                listen=tcp:${HOST_IP}:${p} \
                 connect=tcp:${IP}:${p} \
                 nat=true >/dev/null
             incus config device add "$NAME" "udp-$p" proxy \
-                listen=udp:0.0.0.0:${p} \
+                listen=udp:${HOST_IP}:${p} \
                 connect=udp:${IP}:${p} \
                 nat=true >/dev/null
         done
