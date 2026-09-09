@@ -26,13 +26,21 @@
 #
 # ---------------------------------------------------------------------------
 # 关于端口转发方式(重要变更说明):
-#   旧版每个端口用 incus proxy device 走用户态转发(forkproxy 进程),
+#   最早版本每个端口用 incus proxy device 走用户态转发(forkproxy 进程),
 #   每台小鸡 20 端口(tcp+udp)= 40 个常驻进程,台数一多内存/句柄容易爆炸。
 #
-#   本版改为 proxy device 加 nat=true,由内核态 iptables/nftables 直接做
-#   DNAT 转发,不再为每个端口 fork 进程,几乎零额外常驻内存开销。
-#   代价:nat=true 模式下宿主机不会真的 listen 该端口(是DNAT不是accept),
-#   所以 check 命令改用查 iptables NAT 规则 + 实际连接测试来验证,而不是 ss -tln。
+#   曾尝试改用 incus proxy device 的 nat=true 内核态转发,但该模式要求
+#   connect 目标IP必须是容器"静态声明"的地址,DHCP动态分配的IP即使数值一样
+#   也会被拒绝,且事后 override+restart 也不保证生效,坑比较多,故放弃。
+#
+#   最终版本: 完全绕开 incus 的 proxy device,由宿主机直接下发 iptables 端口段级
+#   DNAT 规则(PREROUTING 处理外部转发流量,OUTPUT 镜像一份处理本机自身发起的
+#   连接,比如 check 命令的自检)。一台小鸡只需4条规则(tcp/udp各在两条链各一条),
+#   不再为每个端口 fork 进程,内存开销几乎为零,也没有静态IP校验的问题。
+#   代价: 如果容器重启后从DHCP拿到了不同的IP,已下发的DNAT规则会跟着失效
+#   (规则里的目标IP是创建时那一刻记录死的)。默认桥接网络下 Incus 的DHCP
+#   租约通常会长期稳定复用同一IP,实际使用中重启后IP漂移的概率很低;如果
+#   真的发生,重新跑一次 delete + create 即可恢复。
 # ---------------------------------------------------------------------------
 
 set -e
@@ -160,19 +168,6 @@ cmd_create() {
 
     check_disk_quota_support
 
-    # nat=true 模式下 proxy device 不允许监听通配地址 0.0.0.0,必须绑定宿主机网卡的具体IP。
-    # OCI等云主机的"公网IP"通常是网关层1:1 NAT到私网IP,系统自己只看得到私网IP,
-    # 绑定这个私网IP即可,通过公网IP访问时网关会自动转进来。
-    HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
-    if [ -z "$HOST_IP" ]; then
-        HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    fi
-    if [ -z "$HOST_IP" ]; then
-        echo "!! 无法自动探测宿主机网卡IP,请手动检查网络配置后重试"
-        exit 1
-    fi
-    echo "宿主机绑定IP(用于端口转发监听): ${HOST_IP}"
-
     get_next_index() {
         local i=1
         while incus info "${NAME_PREFIX}${i}" &>/dev/null; do
@@ -181,10 +176,8 @@ cmd_create() {
         echo $i
     }
 
-    # 端口段是否与本机已在监听的端口冲突(比如80/443/其他服务),冲突则跳过整段往后找
-    # 注意: nat=true 模式下,已分配给其他小鸡的端口不会出现在 ss -tln 里(是DNAT不是listen),
-    # 所以这里只能防真实占用(比如宿主机自己跑的服务),防不了"跟其他小鸡端口段重叠"。
-    # 重叠问题由 STATE_FILE 递增分配来保证,不依赖 ss 检测。
+    # 端口段是否与本机已在监听的端口冲突(比如80/443/其他服务),冲突则跳过整段往后找。
+    # 已分配给其他小鸡的端口段由 STATE_FILE 递增分配保证不重叠,这里只防真实占用。
     find_free_port_start() {
         local candidate=$1
         while true; do
@@ -239,38 +232,6 @@ cmd_create() {
 
         sleep 3
 
-        # nat=true 模式要求 proxy device 的 connect IP 必须是容器"静态声明"的地址,
-        # 单纯DHCP动态分配的IP即使数值一样也会被拒绝(报错 must be one of the instance's
-        # static IPv4 addresses)。这里找到容器的网卡设备名,把当前拿到的IP显式声明为静态。
-        NIC_DEVICE=""
-        for d in $(incus config device list "$NAME" 2>/dev/null); do
-            t=$(incus config device get "$NAME" "$d" type 2>/dev/null || echo "")
-            if [ "$t" = "nic" ]; then
-                NIC_DEVICE="$d"
-                break
-            fi
-        done
-        if [ -z "$NIC_DEVICE" ]; then
-            echo "!! $NAME 找不到网卡设备名,跳过端口转发,请手动检查: incus config device list $NAME"
-            continue
-        fi
-        incus config device override "$NAME" "$NIC_DEVICE" ipv4.address="${IP}" >/dev/null
-
-        # 仅仅"登记"为静态还不够,容器手里还攥着之前DHCP动态分配的旧租约,
-        # 必须重启一次让它重新走DHCP,dnsmasq才会真正把这个IP作为保留地址分配下去,
-        # 之后 config device override 声明的"静态"校验才会通过。
-        incus restart "$NAME"
-        for i in $(seq 1 15); do
-            CUR_IP=$(incus list "$NAME" -c 4 --format csv | cut -d' ' -f1)
-            [ "$CUR_IP" = "$IP" ] && break
-            sleep 2
-        done
-        if [ "$CUR_IP" != "$IP" ]; then
-            echo "!! $NAME 重启后IP有变化(重启前=$IP 重启后=$CUR_IP),改用重启后的实际IP继续"
-            IP="$CUR_IP"
-        fi
-        sleep 2
-
         # Alpine 用 apk 装包、ash 跑脚本、OpenRC 管服务,和 Debian 版(apt/bash/systemd)不一样
         incus exec "$NAME" -- sh -c "apk update -q && apk add -q openssh"
         incus exec "$NAME" -- sh -c "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
@@ -280,33 +241,41 @@ cmd_create() {
         incus exec "$NAME" -- sh -c "echo 'root:${PASSWORD}' | chpasswd"
         incus exec "$NAME" -- sh -c "rc-update add sshd default && (rc-service sshd restart || rc-service sshd start)"
 
-        # ---- 端口转发: 全部走 nat=true 内核态转发,不再 fork 用户态进程 ----
-        # 注意 connect 目标必须是容器的真实IP(不能用127.0.0.1),因为是内核DNAT。
+        # ---- 端口转发: 宿主机直接下 iptables 端口段级 DNAT,不经过 incus proxy device ----
+        # 一台小鸡只需2条规则(tcp+udp各一条),覆盖整个端口段(SSH端口就是段内第一个端口,
+        # 不用单独处理)。用 --comment 打上容器名标记,方便 delete 时精确清理。
+        # 与前一版 incus nat=true proxy device 方案相比: 不再有"connect IP必须是静态声明
+        # 地址"的校验问题,也不会为每个端口fork独立进程,内存开销几乎为零。
         SSH_PORT=$PORT_START
-        incus config device add "$NAME" sshport proxy \
-            listen=tcp:${HOST_IP}:${SSH_PORT} \
-            connect=tcp:${IP}:22 \
-            nat=true >/dev/null
-
-        for p in $(seq $((PORT_START+1)) $PORT_END); do
-            incus config device add "$NAME" "tcp-$p" proxy \
-                listen=tcp:${HOST_IP}:${p} \
-                connect=tcp:${IP}:${p} \
-                nat=true >/dev/null
-            incus config device add "$NAME" "udp-$p" proxy \
-                listen=udp:${HOST_IP}:${p} \
-                connect=udp:${IP}:${p} \
-                nat=true >/dev/null
-        done
+        iptables -t nat -A PREROUTING -p tcp --dport ${PORT_START}:${PORT_END} \
+            -m comment --comment "${NAME}" \
+            -j DNAT --to-destination ${IP}:${PORT_START}-${PORT_END}
+        iptables -t nat -A PREROUTING -p udp --dport ${PORT_START}:${PORT_END} \
+            -m comment --comment "${NAME}" \
+            -j DNAT --to-destination ${IP}:${PORT_START}-${PORT_END}
+        # PREROUTING 只对"转发进来"的流量生效,宿主机自己发起的连接(比如 check 命令里
+        # 测试 127.0.0.1:端口)走的是 OUTPUT 链,不会命中上面的规则,这里镜像加一份,
+        # 方便本机自检,也方便宿主机上跑的程序直接访问自己创建的小鸡。
+        iptables -t nat -A OUTPUT -p tcp --dport ${PORT_START}:${PORT_END} \
+            -m comment --comment "${NAME}" \
+            -j DNAT --to-destination ${IP}:${PORT_START}-${PORT_END}
+        iptables -t nat -A OUTPUT -p udp --dport ${PORT_START}:${PORT_END} \
+            -m comment --comment "${NAME}" \
+            -j DNAT --to-destination ${IP}:${PORT_START}-${PORT_END}
 
         echo -e "${NAME}\t${IP}\t${SSH_PORT}\t${PORT_START}-${PORT_END}\t${PASSWORD}\t${CPU}\t${MEM}\t${DISK}" >> "$LOG_FILE"
         echo "$NAME 完成: SSH端口=${SSH_PORT} 密码=${PASSWORD} CPU=${CPU} 内存=${MEM} 磁盘=${DISK}"
     done
 
     echo ""
+    echo "持久化 iptables 规则,确保重启后不丢失..."
+    netfilter-persistent save >/dev/null 2>&1 || true
+
+    echo ""
     echo "全部完成,汇总如下:"
     column -t -s $'\t' "$LOG_FILE"
 }
+
 
 # ================= 子命令: resize =================
 # 调整已存在小鸡的资源限制。留空的参数表示不改该项。
@@ -387,7 +356,19 @@ cmd_delete() {
         exit 1
     fi
 
-    echo "删除容器 $NAME(会自动清理其端口转发规则,包括nat=true下发的iptables规则)..."
+    echo "清理 $NAME 的 iptables 端口转发规则..."
+    # 按 --comment 标记精确匹配并删除对应规则(用 -S 拿到规则原始参数,把 -A 换成 -D 就是删除命令)
+    # PREROUTING 和 OUTPUT 两条链创建时都下发了,删除时也都要清理。
+    for chain in PREROUTING OUTPUT; do
+        while IFS= read -r rule; do
+            [ -z "$rule" ] && continue
+            del_cmd="${rule/-A ${chain}/-D ${chain}}"
+            eval "iptables -t nat $del_cmd" 2>/dev/null || true
+        done < <(iptables -t nat -S "$chain" 2>/dev/null | grep -- "--comment ${NAME}\b")
+    done
+    netfilter-persistent save >/dev/null 2>&1 || true
+
+    echo "删除容器 $NAME ..."
     incus delete "$NAME" --force
 
     if [ -f "$LOG_FILE" ]; then
@@ -422,11 +403,11 @@ cmd_check() {
     PASSWORD=$(echo "$ROW" | cut -f5)
 
     echo "===== 自检 $NAME (本机SSH端口 ${SSH_PORT}) ====="
-    echo "1) NAT转发规则是否已下发(nat=true模式下宿主机不会listen该端口,查iptables NAT表):"
-    if iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q "dpt:${SSH_PORT}[^0-9]"; then
-        echo "   OK - 找到 ${SSH_PORT} 的DNAT规则"
+    echo "1) iptables DNAT 规则是否已下发:"
+    if iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "--comment ${NAME}\b"; then
+        echo "   OK - 找到 ${NAME} 对应的DNAT规则"
     else
-        echo "   !! 没找到 ${SSH_PORT} 的DNAT规则,proxy device 可能没生效,检查: incus config device list ${NAME}"
+        echo "   !! 没找到 ${NAME} 的DNAT规则,检查: iptables -t nat -L PREROUTING -n --line-numbers"
         return
     fi
 
