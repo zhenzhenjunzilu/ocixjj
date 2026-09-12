@@ -6,6 +6,8 @@
 #
 # 用法:
 #   sudo ./chicken.sh init                      初始化环境:装 Incus、自动初始化、放开本机防火墙(只需跑一次)
+#   sudo ./chicken.sh build-image               构建自定义基础镜像(预装好sshd),之后create会自动使用,大幅提速(建议先跑一次)
+#   sudo ./chicken.sh delete-image              删除自定义基础镜像,create会退回用原始镜像现装sshd
 #   sudo ./chicken.sh create [N] [CPU%] [MEM] [DISK]
 #                                                批量创建 N 台(默认1台),自动分配端口段、装ssh、随机密码
 #                                                CPU%/MEM/DISK 可选,不填则用脚本顶部默认值
@@ -28,9 +30,12 @@
 set -e
 
 # ================= 可调参数 =================
-PORTS_PER=20                                  # 每台小鸡分配的端口数量
+PORTS_PER=5                                   # 每台小鸡分配的端口数量(前3个tcp,含ssh端口;后2个udp)
 POOL_START=21000                              # 端口池起始端口(建议避开20000-20099等常见默认端口)
-IMAGE="images:alpine/edge"                    # 容器镜像(Alpine,体积小,适合高密度切鸡;edge=始终指向当前可用最新版,不会像固定版本号那样过期下架)
+IMAGE="images:alpine/edge"                    # 原始容器镜像(Alpine,体积小,适合高密度切鸡;edge=始终指向当前可用最新版,不会像固定版本号那样过期下架)
+CUSTOM_IMAGE="chicken-base"                   # build-image 生成的自定义基础镜像别名。create时若存在会优先使用它(已预装配置好sshd),
+                                               # 省掉每台apk update/install的网络等待,建议先跑一次: sudo ./chicken.sh build-image
+BUILD_TMP_NAME="chicken-image-builder"        # 构建自定义基础镜像时使用的临时容器名
 STATE_FILE="/root/chicken_port_pool.state"    # 端口池分配进度记录
 LOG_FILE="/root/chicken_accounts.txt"         # 账号信息记录(名称/IP/SSH端口/端口段/密码/CPU/内存/磁盘)
 NAME_PREFIX="ck"                              # 小鸡命名前缀,如 ck1 ck2 ck3
@@ -68,6 +73,18 @@ check_disk_quota_support() {
             echo "   如需强制磁盘配额,建议存储池换成 zfs 或 btrfs (需在 incus admin init 时选择)。"
             ;;
     esac
+}
+
+# 获取指定容器的IPv4地址(带重试),返回空字符串表示失败
+wait_for_ip() {
+    local name="$1"
+    local ip=""
+    for i in $(seq 1 15); do
+        ip=$(incus list "$name" -c 4 --format csv | head -n1 | cut -d',' -f1)
+        [ -n "$ip" ] && break
+        sleep 2
+    done
+    echo "$ip"
 }
 
 # ================= 子命令: init =================
@@ -126,8 +143,68 @@ EOF
     echo "本机公网IP: ${PUB_IP}"
     echo "!! 别忘了去 OCI 控制台放行 Security List: Source 0.0.0.0/0, Protocol All Protocols"
     echo "!! 否则本机端口开了也没用,外部连不进来"
+    echo ""
+    echo "建议接下来先跑一次: sudo ./chicken.sh build-image  构建自定义基础镜像,后续批量创建会快很多。"
 
     check_disk_quota_support
+}
+
+# ================= 子命令: build-image =================
+# 起一个临时容器,装好openssh并把开机自启配好,然后publish成本地镜像。
+# 之后 create 会自动检测并优先使用这个镜像,省掉每台重复 apk update/install 的网络耗时。
+#
+# 注意: 这里故意不在构建阶段启动sshd(不生成host key)。Alpine的sshd openrc初始化脚本
+# 在服务真正启动时会自动执行 ssh-keygen -A 补全缺失的host key,所以每台新容器首次开机
+# 会各自生成自己独立的host key,不会出现"所有小鸡共用同一个SSH host key"的问题。
+cmd_build_image() {
+    echo "===== 构建自定义基础镜像 [$CUSTOM_IMAGE] ====="
+
+    if incus info "$BUILD_TMP_NAME" &>/dev/null; then
+        echo "发现残留的临时容器 $BUILD_TMP_NAME,先清理..."
+        incus delete "$BUILD_TMP_NAME" --force
+    fi
+
+    echo "----- 启动临时容器 -----"
+    incus launch "$IMAGE" "$BUILD_TMP_NAME"
+
+    echo "----- 等待网络就绪 -----"
+    IP=$(wait_for_ip "$BUILD_TMP_NAME")
+    if [ -z "$IP" ]; then
+        echo "!! 临时容器没拿到IP,构建失败。容器已保留(名称: $BUILD_TMP_NAME),可手动排查后重跑本命令,或先 incus delete $BUILD_TMP_NAME --force 清理。"
+        exit 1
+    fi
+    sleep 3
+
+    echo "----- 安装并配置 openssh(不启动,交给每台容器首次开机自己生成host key) -----"
+    incus exec "$BUILD_TMP_NAME" -- sh -c "apk update -q && apk add -q openssh"
+    incus exec "$BUILD_TMP_NAME" -- sh -c "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
+    incus exec "$BUILD_TMP_NAME" -- sh -c "sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"
+    incus exec "$BUILD_TMP_NAME" -- sh -c "rc-update add sshd default"
+
+    echo "----- 停止容器并 publish 成镜像 -----"
+    incus stop "$BUILD_TMP_NAME"
+    if incus image list -c l --format csv | grep -qx "$CUSTOM_IMAGE"; then
+        echo "已存在同名镜像 [$CUSTOM_IMAGE],先删除旧的..."
+        incus image delete "$CUSTOM_IMAGE"
+    fi
+    incus publish "$BUILD_TMP_NAME" --alias "$CUSTOM_IMAGE" >/dev/null
+
+    echo "----- 清理临时容器 -----"
+    incus delete "$BUILD_TMP_NAME" --force
+
+    echo ""
+    echo "===== 基础镜像 [$CUSTOM_IMAGE] 构建完成 ====="
+    echo "之后跑 create 会自动检测到并优先使用它,单台创建耗时可以省掉 apk update/install 那一步的网络等待。"
+}
+
+# ================= 子命令: delete-image =================
+cmd_delete_image() {
+    if ! incus image list -c l --format csv | grep -qx "$CUSTOM_IMAGE"; then
+        echo "自定义镜像 [$CUSTOM_IMAGE] 不存在,无需删除"
+        exit 0
+    fi
+    incus image delete "$CUSTOM_IMAGE"
+    echo "已删除自定义镜像 [$CUSTOM_IMAGE],之后 create 会退回使用原始镜像 [$IMAGE] 并重新走 apk 安装流程"
 }
 
 # ================= 子命令: create =================
@@ -137,6 +214,11 @@ cmd_create() {
     local MEM=${3:-$DEFAULT_MEM}
     local DISK=${4:-$DEFAULT_DISK}
 
+    if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [ "$COUNT" -lt 1 ]; then
+        echo "N 必须是正整数,收到的是: $COUNT"
+        exit 1
+    fi
+
     # 兼容:如果用户传了纯数字(比如 "2"),自动补上 % 号,避免手滑忘记加%
     case "$CPU" in
         *%) ;;
@@ -144,9 +226,24 @@ cmd_create() {
     esac
 
     [ -f "$STATE_FILE" ] || echo "$POOL_START" > "$STATE_FILE"
-    [ -f "$LOG_FILE" ] || echo -e "名称\tIP\tSSH端口\t端口段\t密码\tCPU\t内存\t磁盘" > "$LOG_FILE"
+    if [ ! -f "$LOG_FILE" ]; then
+        echo -e "名称\tIP\tSSH端口\t端口段\t密码\tCPU\t内存\t磁盘" > "$LOG_FILE"
+    fi
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
 
     check_disk_quota_support
+
+    # 判断是否有自定义基础镜像可用
+    local BASE_IMAGE="$IMAGE"
+    local USE_CUSTOM=0
+    if incus image list -c l --format csv | grep -qx "$CUSTOM_IMAGE"; then
+        BASE_IMAGE="$CUSTOM_IMAGE"
+        USE_CUSTOM=1
+        echo "检测到自定义基础镜像 [$CUSTOM_IMAGE],将使用它加速创建(跳过apk安装步骤)"
+    else
+        echo "!! 提示: 未检测到自定义基础镜像,本次将用原始镜像现装sshd,速度较慢。"
+        echo "   如果经常大批量创建,建议先跑一次: sudo ./chicken.sh build-image"
+    fi
 
     get_next_index() {
         local i=1
@@ -175,9 +272,10 @@ cmd_create() {
         done
     }
 
-    echo "开始批量创建 $COUNT 台 (每台限制: CPU=${CPU} 内存=${MEM} 磁盘=${DISK})..."
+    echo "开始批量创建 $COUNT 台 (每台限制: CPU=${CPU} 内存=${MEM} 磁盘=${DISK}, 每台${PORTS_PER}个端口: 3 tcp含ssh + 2 udp)..."
 
     for n in $(seq 1 "$COUNT"); do
+        (
         IDX=$(get_next_index)
         NAME="${NAME_PREFIX}${IDX}"
 
@@ -192,43 +290,50 @@ cmd_create() {
         #   -c limits.cpu.allowance=  CPU 时间片百分比(不是核数,可以设很小,如 5%)
         #   -c limits.memory=         内存上限
         #   -d root,size=             根盘大小限制(需存储池驱动支持配额才会真正强制)
-        incus launch "$IMAGE" "$NAME" \
+        incus launch "$BASE_IMAGE" "$NAME" \
             -c limits.cpu.allowance="${CPU}" \
             -c limits.memory="${MEM}" \
             -d root,size="${DISK}"
 
-        IP=""
-        for i in $(seq 1 15); do
-            IP=$(incus list "$NAME" -c 4 --format csv | cut -d' ' -f1)
-            [ -n "$IP" ] && break
-            sleep 2
-        done
-
+        IP=$(wait_for_ip "$NAME")
         if [ -z "$IP" ]; then
             echo "!! $NAME 没拿到IP,跳过,请手动检查(incus exec $NAME -- ip a)"
-            continue
+            exit 1
         fi
-
         sleep 3
 
-        # Alpine 用 apk 装包、ash 跑脚本、OpenRC 管服务,和 Debian 版(apt/bash/systemd)不一样
-        incus exec "$NAME" -- sh -c "apk update -q && apk add -q openssh"
-        incus exec "$NAME" -- sh -c "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
-        incus exec "$NAME" -- sh -c "sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"
-
         PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
-        incus exec "$NAME" -- sh -c "echo 'root:${PASSWORD}' | chpasswd"
-        incus exec "$NAME" -- sh -c "rc-update add sshd default && (rc-service sshd restart || rc-service sshd start)"
 
+        if [ "$USE_CUSTOM" -eq 1 ]; then
+            # 自定义镜像已经预装配置好sshd并设了开机自启,这里只需设密码
+            incus exec "$NAME" -- sh -c "echo 'root:${PASSWORD}' | chpasswd"
+            # 兜底: 万一开机自启没生效(极少数情况),手动确认一下
+            incus exec "$NAME" -- sh -c "rc-service sshd status >/dev/null 2>&1 || (rc-update add sshd default; rc-service sshd restart || rc-service sshd start)"
+        else
+            # 原始镜像:走完整安装配置流程(Alpine 用 apk 装包、ash 跑脚本、OpenRC 管服务)
+            incus exec "$NAME" -- sh -c "apk update -q && apk add -q openssh"
+            incus exec "$NAME" -- sh -c "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
+            incus exec "$NAME" -- sh -c "sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"
+            incus exec "$NAME" -- sh -c "echo 'root:${PASSWORD}' | chpasswd"
+            incus exec "$NAME" -- sh -c "rc-update add sshd default && (rc-service sshd restart || rc-service sshd start)"
+        fi
+
+        # ---- 端口分配: 每台 PORTS_PER(5)个端口 ----
+        # PORT_START            : ssh端口 (tcp)
+        # PORT_START+1..+2      : 额外 tcp 端口 (共3个tcp,含ssh)
+        # PORT_START+3..+4      : udp 端口 (共2个udp)
         SSH_PORT=$PORT_START
         incus config device add "$NAME" sshport proxy \
             listen=tcp:0.0.0.0:${SSH_PORT} \
             connect=tcp:127.0.0.1:22 >/dev/null
 
-        for p in $(seq $((PORT_START+1)) $PORT_END); do
+        for p in $(seq $((PORT_START+1)) $((PORT_START+2))); do
             incus config device add "$NAME" "tcp-$p" proxy \
                 listen=tcp:0.0.0.0:${p} \
                 connect=tcp:127.0.0.1:${p} >/dev/null
+        done
+
+        for p in $(seq $((PORT_START+3)) $((PORT_START+4))); do
             incus config device add "$NAME" "udp-$p" proxy \
                 listen=udp:0.0.0.0:${p} \
                 connect=udp:127.0.0.1:${p} >/dev/null
@@ -236,6 +341,7 @@ cmd_create() {
 
         echo -e "${NAME}\t${IP}\t${SSH_PORT}\t${PORT_START}-${PORT_END}\t${PASSWORD}\t${CPU}\t${MEM}\t${DISK}" >> "$LOG_FILE"
         echo "$NAME 完成: SSH端口=${SSH_PORT} 密码=${PASSWORD} CPU=${CPU} 内存=${MEM} 磁盘=${DISK}"
+        ) || echo "!! 第 $n 台创建过程中出错,已跳过,继续创建下一台"
     done
 
     echo ""
@@ -285,7 +391,7 @@ cmd_resize() {
     fi
 
     # 同步更新 LOG_FILE 里的记录(如果存在这一行)
-    if [ -f "$LOG_FILE" ] && grep -q "^${NAME}	" "$LOG_FILE"; then
+    if [ -f "$LOG_FILE" ] && awk -F'\t' -v n="$NAME" '$1==n{found=1} END{exit !found}' "$LOG_FILE"; then
         local CUR_CPU CUR_MEM CUR_DISK
         CUR_CPU=$(incus config get "$NAME" limits.cpu.allowance 2>/dev/null || echo "-")
         CUR_MEM=$(incus config get "$NAME" limits.memory 2>/dev/null || echo "-")
@@ -326,7 +432,7 @@ cmd_delete() {
     incus delete "$NAME" --force
 
     if [ -f "$LOG_FILE" ]; then
-        grep -vP "^${NAME}\t" "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+        awk -F'\t' -v n="$NAME" 'BEGIN{OFS="\t"} $1!=n{print}' "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
     fi
 
     echo "$NAME 已删除。注意:它占用的端口段不会自动回收复用,新建的小鸡会继续往后分配,避免冲突。"
@@ -346,7 +452,7 @@ cmd_check() {
     fi
 
     local ROW
-    ROW=$(grep -P "^${NAME}\t" "$LOG_FILE" || true)
+    ROW=$(awk -F'\t' -v n="$NAME" '$1==n{print; exit}' "$LOG_FILE")
     if [ -z "$ROW" ]; then
         echo "在 $LOG_FILE 中找不到 $NAME 的记录"
         exit 1
@@ -391,6 +497,12 @@ case "$1" in
     init)
         cmd_init
         ;;
+    build-image)
+        cmd_build_image
+        ;;
+    delete-image)
+        cmd_delete_image
+        ;;
     create)
         cmd_create "$2" "$3" "$4" "$5"
         ;;
@@ -409,6 +521,8 @@ case "$1" in
     *)
         echo "用法:"
         echo "  sudo ./chicken.sh init                          初始化环境(装Incus+自动init+放开防火墙,只需跑一次)"
+        echo "  sudo ./chicken.sh build-image                   构建自定义基础镜像(预装sshd),建议先跑一次以加速批量创建"
+        echo "  sudo ./chicken.sh delete-image                  删除自定义基础镜像,退回用原始镜像现装sshd"
         echo "  sudo ./chicken.sh create [N] [CPU%] [MEM] [DISK] 批量创建N台小鸡(默认1台,资源限制用脚本顶部默认值)"
         echo "                                                   示例: sudo ./chicken.sh create 50 5% 128MiB 512MiB"
         echo "  sudo ./chicken.sh resize <名称> [CPU%] [MEM] [DISK]  调整已存在小鸡的资源限制(留空项不改)"
