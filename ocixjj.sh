@@ -496,6 +496,121 @@ cmd_check() {
     echo "   磁盘: $(incus config device get "$NAME" root size 2>/dev/null || echo '未设置(不限)')"
 }
 
+# ================= 交互式菜单 =================
+
+# 列出当前已记录的小鸡名称,方便菜单里选择时参考
+menu_list_names() {
+    if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt 1 ]; then
+        echo "当前小鸡列表:"
+        awk -F'\t' 'NR>1{print "  - "$1"  (SSH端口:"$3")"}' "$LOG_FILE"
+    else
+        echo "(当前还没有任何小鸡记录)"
+    fi
+}
+
+# 按任意键返回菜单
+menu_pause() {
+    echo ""
+    read -rp "按回车键返回菜单..." _
+}
+
+# 包一层子shell执行,防止 cmd_* 内部的 exit 1 把整个交互菜单进程带崩掉
+# (脚本顶部开了 set -e,子shell失败只会让这条 if 判断为假,不会终止父进程)
+menu_run() {
+    if ( "$@" ); then
+        :
+    else
+        echo ""
+        echo "!! 操作未完成(输入有误或执行中出错),已返回菜单"
+    fi
+}
+
+menu_do_create() {
+    read -rp "创建几台? [默认1]: " count
+    count=${count:-1}
+    read -rp "CPU百分比,如 5% [默认${DEFAULT_CPU}]: " cpu
+    cpu=${cpu:-$DEFAULT_CPU}
+    read -rp "内存,如 128MiB [默认${DEFAULT_MEM}]: " mem
+    mem=${mem:-$DEFAULT_MEM}
+    read -rp "磁盘,如 512MiB [默认${DEFAULT_DISK}]: " disk
+    disk=${disk:-$DEFAULT_DISK}
+    menu_run cmd_create "$count" "$cpu" "$mem" "$disk"
+}
+
+menu_do_resize() {
+    menu_list_names
+    echo ""
+    read -rp "输入要调整的小鸡名称: " name
+    [ -z "$name" ] && { echo "名称不能为空"; return; }
+    read -rp "新CPU百分比(留空不改): " cpu
+    read -rp "新内存(留空不改): " mem
+    read -rp "新磁盘(留空不改): " disk
+    menu_run cmd_resize "$name" "$cpu" "$mem" "$disk"
+}
+
+menu_do_delete() {
+    menu_list_names
+    echo ""
+    read -rp "输入要删除的小鸡名称: " name
+    [ -z "$name" ] && { echo "名称不能为空"; return; }
+    read -rp "!! 确认删除 [$name] ? 此操作不可恢复,输入 yes 确认: " confirm
+    if [ "$confirm" = "yes" ]; then
+        menu_run cmd_delete "$name"
+    else
+        echo "已取消,未做任何改动"
+    fi
+}
+
+menu_do_check() {
+    menu_list_names
+    echo ""
+    read -rp "输入要自检的小鸡名称: " name
+    [ -z "$name" ] && { echo "名称不能为空"; return; }
+    menu_run cmd_check "$name"
+}
+
+cmd_menu() {
+    while true; do
+        clear
+        echo "================================================"
+        echo "          chicken.sh 交互菜单"
+        echo "================================================"
+        local total
+        total=$(incus list -c n --format csv 2>/dev/null | grep -c "^${NAME_PREFIX}" || echo 0)
+        echo " 当前小鸡数量: ${total}"
+        if incus image list -c l --format csv 2>/dev/null | grep -qx "$CUSTOM_IMAGE"; then
+            echo " 自定义基础镜像: 已构建 [$CUSTOM_IMAGE]"
+        else
+            echo " 自定义基础镜像: 未构建(create会用原始镜像现装,较慢)"
+        fi
+        echo "------------------------------------------------"
+        echo "  1) 初始化环境           (init)"
+        echo "  2) 构建加速基础镜像     (build-image)"
+        echo "  3) 删除基础镜像         (delete-image)"
+        echo "  4) 批量创建小鸡         (create)"
+        echo "  5) 查看所有小鸡         (list)"
+        echo "  6) 调整某台资源限制     (resize)"
+        echo "  7) 删除某台小鸡         (delete)"
+        echo "  8) 自检某台小鸡SSH      (check)"
+        echo "  0) 退出"
+        echo "------------------------------------------------"
+        read -rp "请选择操作 [0-8]: " choice
+        echo ""
+        case "$choice" in
+            1) menu_run cmd_init; menu_pause ;;
+            2) menu_run cmd_build_image; menu_pause ;;
+            3) menu_run cmd_delete_image; menu_pause ;;
+            4) menu_do_create; menu_pause ;;
+            5) menu_run cmd_list; menu_pause ;;
+            6) menu_do_resize; menu_pause ;;
+            7) menu_do_delete; menu_pause ;;
+            8) menu_do_check; menu_pause ;;
+            0) echo "已退出"; exit 0 ;;
+            *) echo "无效选择,请输入 0-8 之间的数字"; sleep 1 ;;
+        esac
+    done
+}
+
 # ================= 主入口 =================
 require_root
 
@@ -524,8 +639,13 @@ case "$1" in
     check)
         cmd_check "$2"
         ;;
+    menu|"")
+        cmd_menu
+        ;;
     *)
         echo "用法:"
+        echo "  sudo ./chicken.sh                               不带任何参数 = 进入交互菜单,数字选操作,不用记命令"
+        echo "  sudo ./chicken.sh menu                          同上,显式进入交互菜单"
         echo "  sudo ./chicken.sh init                          初始化环境(装Incus+自动init+放开防火墙,只需跑一次)"
         echo "  sudo ./chicken.sh build-image                   构建自定义基础镜像(预装sshd),建议先跑一次以加速批量创建"
         echo "  sudo ./chicken.sh delete-image                  删除自定义基础镜像,退回用原始镜像现装sshd"
