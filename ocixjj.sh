@@ -121,12 +121,18 @@ EOF
     fi
 
     echo "===== 3. 初始化 Incus(全自动默认配置) ====="
-    if ! incus info &>/dev/null; then
+    # 注意: 不能只用 `incus info` 是否成功来判断"是否已初始化"——
+    # 只要 incus 服务装好并启动了,`incus info` 就会成功,哪怕存储池/网络都还没配置,
+    # 这会导致 admin init --auto 被误判跳过,后续 incus launch 报错
+    # "Failed getting root disk: No root device could be found"。
+    # 改成直接检查 default profile 是否真的挂了 root 存储设备,这才是判断"是否已初始化"的准确依据。
+    if ! incus profile device get default root pool &>/dev/null; then
+        echo "检测到 default profile 缺少 root 存储设备,执行自动初始化..."
         incus admin init --auto
         echo "已用默认配置自动初始化(本地存储 + 网桥NAT网络)。"
         echo "如果你需要自定义存储池/网络(比如想用 zfs 以支持磁盘配额),请先执行: incus admin init 手动配置,再重跑本脚本。"
     else
-        echo "Incus 已初始化,跳过"
+        echo "Incus 已初始化(default profile 已有 root 存储设备),跳过"
     fi
 
     echo "===== 4. 放开本机 iptables(全部放行,防火墙统一交给OCI控制台管) ====="
@@ -175,8 +181,8 @@ cmd_build_image() {
     fi
     sleep 3
 
-    echo "----- 安装并配置 openssh(不启动,交给每台容器首次开机自己生成host key) -----"
-    incus exec "$BUILD_TMP_NAME" -- sh -c "apk update -q && apk add -q openssh"
+    echo "----- 安装openssh/bash/curl并配置(不启动sshd,交给每台容器首次开机自己生成host key) -----"
+    incus exec "$BUILD_TMP_NAME" -- sh -c "apk update -q && apk add -q openssh bash curl"
     incus exec "$BUILD_TMP_NAME" -- sh -c "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
     incus exec "$BUILD_TMP_NAME" -- sh -c "sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"
     incus exec "$BUILD_TMP_NAME" -- sh -c "rc-update add sshd default"
@@ -311,7 +317,7 @@ cmd_create() {
             incus exec "$NAME" -- sh -c "rc-service sshd status >/dev/null 2>&1 || (rc-update add sshd default; rc-service sshd restart || rc-service sshd start)"
         else
             # 原始镜像:走完整安装配置流程(Alpine 用 apk 装包、ash 跑脚本、OpenRC 管服务)
-            incus exec "$NAME" -- sh -c "apk update -q && apk add -q openssh"
+            incus exec "$NAME" -- sh -c "apk update -q && apk add -q openssh bash curl"
             incus exec "$NAME" -- sh -c "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
             incus exec "$NAME" -- sh -c "sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config"
             incus exec "$NAME" -- sh -c "echo 'root:${PASSWORD}' | chpasswd"
