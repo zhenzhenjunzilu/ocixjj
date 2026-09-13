@@ -33,6 +33,12 @@ ARM / AMD 主机 Incus 容器批量分发管理脚本。
 
 ---
 
+## 一键下载
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhenzhenjunzilu/ocixjj/main/ocixjj.sh -o chicken.sh
+```
+
 ## 安装
 
 ```bash
