@@ -296,9 +296,12 @@ cmd_create() {
         #   -c limits.cpu.allowance=  CPU 时间片百分比(不是核数,可以设很小,如 5%)
         #   -c limits.memory=         内存上限
         #   -d root,size=             根盘大小限制(需存储池驱动支持配额才会真正强制)
+        # boot.autostart=true: 让容器在宿主机重启/Incus服务重启后自动拉起,
+        # 否则默认容器停机后不会自己起来,需要手动 incus start
         incus launch "$BASE_IMAGE" "$NAME" \
             -c limits.cpu.allowance="${CPU}" \
             -c limits.memory="${MEM}" \
+            -c boot.autostart=true \
             -d root,size="${DISK}"
 
         IP=$(wait_for_ip "$NAME")
@@ -496,7 +499,45 @@ cmd_check() {
     echo "   磁盘: $(incus config device get "$NAME" root size 2>/dev/null || echo '未设置(不限)')"
 }
 
-# ================= 交互式菜单 =================
+# ================= 子命令: restart =================
+# 重启指定小鸡,或传 all 重启全部小鸡
+cmd_restart() {
+    local NAME="$1"
+    if [ -z "$NAME" ]; then
+        echo "用法: sudo ./chicken.sh restart <名称|all>"
+        echo "  示例: sudo ./chicken.sh restart ck1"
+        echo "        sudo ./chicken.sh restart all"
+        exit 1
+    fi
+
+    if [ "$NAME" = "all" ]; then
+        local names
+        names=$(incus list -c n --format csv | grep "^${NAME_PREFIX}" || true)
+        if [ -z "$names" ]; then
+            echo "没有找到任何以 ${NAME_PREFIX} 开头的小鸡"
+            return
+        fi
+        echo "即将重启以下小鸡:"
+        echo "$names" | sed 's/^/  - /'
+        for n in $names; do
+            echo "-- 重启 $n"
+            incus restart "$n" --timeout 30 2>/dev/null || incus start "$n" 2>/dev/null || echo "   !! $n 重启失败,请手动检查"
+        done
+        echo "全部重启完成,建议稍等几秒后跑: sudo ./chicken.sh list 确认状态"
+        return
+    fi
+
+    if ! incus info "$NAME" &>/dev/null; then
+        echo "容器 $NAME 不存在"
+        exit 1
+    fi
+
+    echo "正在重启 $NAME ..."
+    incus restart "$NAME" --timeout 30 2>/dev/null || incus start "$NAME"
+    echo "$NAME 已重启,建议稍等几秒后跑: sudo ./chicken.sh check $NAME 确认SSH是否恢复"
+}
+
+
 
 # 列出当前已记录的小鸡名称,方便菜单里选择时参考
 menu_list_names() {
@@ -569,6 +610,14 @@ menu_do_check() {
     menu_run cmd_check "$name"
 }
 
+menu_do_restart() {
+    menu_list_names
+    echo ""
+    read -rp "输入要重启的小鸡名称(输入 all 重启全部): " name
+    [ -z "$name" ] && { echo "名称不能为空"; return; }
+    menu_run cmd_restart "$name"
+}
+
 cmd_menu() {
     while true; do
         clear
@@ -592,9 +641,10 @@ cmd_menu() {
         echo "  6) 调整某台资源限制     (resize)"
         echo "  7) 删除某台小鸡         (delete)"
         echo "  8) 自检某台小鸡SSH      (check)"
+        echo "  9) 重启某台/全部小鸡    (restart)"
         echo "  0) 退出"
         echo "------------------------------------------------"
-        read -rp "请选择操作 [0-8]: " choice
+        read -rp "请选择操作 [0-9]: " choice
         echo ""
         case "$choice" in
             1) menu_run cmd_init; menu_pause ;;
@@ -605,8 +655,9 @@ cmd_menu() {
             6) menu_do_resize; menu_pause ;;
             7) menu_do_delete; menu_pause ;;
             8) menu_do_check; menu_pause ;;
+            9) menu_do_restart; menu_pause ;;
             0) echo "已退出"; exit 0 ;;
-            *) echo "无效选择,请输入 0-8 之间的数字"; sleep 1 ;;
+            *) echo "无效选择,请输入 0-9 之间的数字"; sleep 1 ;;
         esac
     done
 }
@@ -639,6 +690,9 @@ case "$1" in
     check)
         cmd_check "$2"
         ;;
+    restart)
+        cmd_restart "$2"
+        ;;
     menu|"")
         cmd_menu
         ;;
@@ -655,6 +709,7 @@ case "$1" in
         echo "  sudo ./chicken.sh list                           查看所有小鸡状态和账号信息/资源限制"
         echo "  sudo ./chicken.sh delete <名称>                  删除指定小鸡"
         echo "  sudo ./chicken.sh check <名称>                   自检该小鸡SSH是否真的通,并显示资源限制"
+        echo "  sudo ./chicken.sh restart <名称|all>             重启指定小鸡,或传 all 重启全部小鸡"
         exit 1
         ;;
 esac
