@@ -84,9 +84,10 @@ sudo ./chicken.sh
   6) 调整某台资源限制     (resize)
   7) 删除某台小鸡         (delete)
   8) 自检某台小鸡SSH      (check)
+  9) 重启某台/全部小鸡    (restart)
   0) 退出
 ------------------------------------------------
-请选择操作 [0-8]:
+请选择操作 [0-9]:
 ```
 
 - 选 `4` 创建时会依次询问台数、CPU、内存、磁盘,直接回车即用默认值
@@ -196,6 +197,15 @@ sudo ./chicken.sh check <名称>
 
 如果第 2 步显示 OK,但你自己电脑连不上外部 IP,问题基本可以锁定在 **OCI 控制台 Security List 没放行**,不用再怀疑脚本或 Incus。
 
+### `restart` —— 重启
+
+```bash
+sudo ./chicken.sh restart <名称>     # 重启单台
+sudo ./chicken.sh restart all        # 重启全部小鸡
+```
+
+用 `incus restart`(优雅重启),失败则自动退化为 `incus start`。重启后建议隔几秒跑一下 `check` 确认 SSH 恢复正常。
+
 ---
 
 ## 端口分配规则
@@ -257,6 +267,17 @@ sudo usermod -aG incus-admin $(whoami)
 
 99% 是 OCI 控制台 Security List 没放行 `0.0.0.0/0, All Protocols`,回到最前面"前置条件"章节确认。
 
+**Q: 宿主机重启后,之前建的小鸡都没跟着起来**
+
+Incus 容器默认不会跟着宿主机重启自动拉起,需要显式设置 `boot.autostart=true`。新版脚本创建的容器已自动带上这个配置;如果是旧版脚本建的容器,手动补一下:
+
+```bash
+for name in $(incus list -c n --format csv); do
+    incus config set "$name" boot.autostart true
+    incus start "$name"
+done
+```
+
 **Q: 想清空重来**
 
 ```bash
@@ -277,6 +298,8 @@ rm -f /root/chicken_accounts.txt /root/chicken_port_pool.state
 
 ## 版本变更记录
 
+- 新增 `restart` 命令,支持重启单台或全部(`all`)小鸡,命令行和交互菜单均可用
+- 新创建的容器自动设置 `boot.autostart=true`,宿主机重启后容器会自动拉起(此前需要手动 `incus start`)
 - 修复 `init` 误判已初始化的问题(原来用 `incus info` 是否成功判断,现在直接检查 `default profile` 是否挂了 `root` 存储设备)
 - `build-image` 现在会预装 `bash` / `curl`,构建出的容器开箱即用
 - 端口从每台 20 个精简为每台 5 个(3 TCP 含 SSH + 2 UDP)
